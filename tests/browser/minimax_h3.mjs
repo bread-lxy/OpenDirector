@@ -1,10 +1,6 @@
 import { chooseGenerationModel } from "./model_picker.mjs";
 /** Official provider configuration and first/last frame edits; no remote generation. */
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { launchBrowser } from "./engine.mjs";
 const base = process.env.CREATION_WEB_URL ?? "http://127.0.0.1:5179";
 const api = process.env.CREATION_API_URL ?? "http://127.0.0.1:8019";
@@ -27,59 +23,7 @@ const page = await browser.newPage({ locale: "en-US", viewport: { width: 1600, h
 await page.addInitScript(() =>
   localStorage.setItem("opendirector.modelSetup.v1", "dismissed"),
 );
-await page.addInitScript(() => {
-  document.addEventListener("change", (event) => {
-    const input = event.target;
-    if (!(input instanceof HTMLInputElement) || input.type !== "file") return;
-    console.debug("H3 file selection", JSON.stringify({
-      files: [...(input.files ?? [])].map((file) => ({ name: file.name, size: file.size, type: file.type })),
-      workspaceBusy: document.querySelector('[data-testid="canvas-workspace"]')?.getAttribute("aria-busy"),
-    }));
-  }, true);
-});
 page.setDefaultTimeout(15000);
-// Diagnostic branch only: retain the original upload sequence and deadlines.
-// Buffer events in memory so recording does not add disk waits during imports.
-const evidenceDir = join(process.env.RUNNER_TEMP ?? tmpdir(), "opendirector-h3");
-mkdirSync(evidenceDir, { recursive: true });
-const events = [];
-const responses = [];
-const started = performance.now();
-let phase = "setup";
-let projectId;
-let lastSnapshot;
-const record = (event) => {
-  const entry = { ms: performance.now() - started, phase, ...event };
-  events.push(entry);
-  return entry;
-};
-page.on("pageerror", (error) => record({ pageError: error.stack }));
-page.on("console", (message) => {
-  if (message.type() === "error") record({ consoleError: message.text() });
-  if (message.text().startsWith("H3 file selection ")) record({ fileSelection: message.text() });
-});
-page.on("requestfailed", (request) => record({
-  requestFailed: request.url(), error: request.failure(),
-}));
-const isWrite = (request) =>
-  request.url().includes("/api/creation/") && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method());
-page.on("request", (request) => {
-  if (!isWrite(request)) return;
-  let body;
-  if (request.headers()["content-type"]?.includes("application/json")) {
-    body = request.postDataJSON();
-  } else {
-    const bytes = request.postDataBuffer();
-    body = { available: bytes !== null, bytes: bytes?.length, sha256: bytes && createHash("sha256").update(bytes).digest("hex") };
-  }
-  record({ request: request.url(), method: request.method(), body });
-});
-page.on("response", (response) => {
-  if (!isWrite(response.request())) return;
-  const event = record({ response: response.url(), status: response.status() });
-  responses.push(response.text().then((body) => { event.body = body; }, (error) => { event.error = String(error); }));
-});
-await page.context().tracing.start({ screenshots: true, snapshots: true });
 try {
   // One official connection with both models, as the provider settings save
   // them; the picker step below switches between the two.
@@ -94,7 +38,7 @@ try {
   });
   const model = saved.find((item) => item.modelId === "MiniMax-H3");
   assert.deepEqual(model.inputRules.frameRoles, ["first_frame", "last_frame"]);
-  projectId = crypto.randomUUID();
+  const projectId = crypto.randomUUID();
   await call(`/api/creation/projects/${projectId}/commands`, {
     commandId: crypto.randomUUID(),
     projectId,
@@ -109,9 +53,55 @@ try {
     canvas.getContext("2d").fillRect(0, 0, 256, 256);
     return canvas.toDataURL("image/png").split(",")[1];
   });
+  // Hold the first save's background hydration until the next import has
+  // queued its local edit. No request, reducer or save result is replaced.
+  await page.evaluate(async (projectId) => {
+    const { workspaceProjection } = await import("/src/backend/workspace.ts");
+    const projection = workspaceProjection(projectId), read = projection.read;
+    const NativeImage = window.Image;
+    let release, heldSnapshot, held = 0, returned = 0, released = false, armed = false;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const restore = () => {
+      projection.read = read;
+      window.Image = NativeImage;
+      released = true;
+      release();
+    };
+    projection.read = async function(snapshot) {
+      const next = await read.call(this, snapshot);
+      if (!heldSnapshot && snapshot?.canvasItems.length === 1) heldSnapshot = snapshot;
+      if (!released && snapshot === heldSnapshot) {
+        held++;
+        await gate;
+        returned++;
+      }
+      return next;
+    };
+    window.Image = new Proxy(NativeImage, {
+      construct(target, args) {
+        const element = Reflect.construct(target, args);
+        // Register after the decoder's own onload handler. Its promise
+        // continuations queue the import before this native load listener runs.
+        queueMicrotask(() => element.addEventListener("load", () => {
+          if (!armed) return;
+          armed = false;
+          restore();
+        }, { once: true }));
+        return element;
+      },
+    });
+    window.__h3RefreshRace = {
+      held: () => held,
+      arm: () => { armed = true; },
+      restore,
+      report: () => ({ held, returned, released, restored: projection.read === read && window.Image === NativeImage }),
+    };
+  }, projectId);
   for (const name of ["first.png", "last.png"]) {
-    phase = `upload ${name}`;
-    record({ upload: name, bytes: Buffer.from(png, "base64").length });
+    if (name === "last.png") {
+      await page.waitForFunction(() => window.__h3RefreshRace.held() > 0);
+      await page.evaluate(() => window.__h3RefreshRace.arm());
+    }
     await page
       .getByLabel("Choose local asset files", { exact: true })
       .setInputFiles({
@@ -122,18 +112,18 @@ try {
     const count = name === "first.png" ? 1 : 2;
     for (let attempt = 0; attempt < 150; attempt++) {
       const current = await call(`/api/creation/projects/${projectId}`);
-      lastSnapshot = current;
-      if (attempt === 0 || attempt === 149 || current.canvasItems.length === count) {
-        record({ poll: attempt, expectedCount: count, actualCount: current.canvasItems.length, snapshot: current });
-      }
       if (current.canvasItems.length === count) break;
       if (attempt === 149) throw Error(`${name}: expected ${count} saved canvas items, received ${current.canvasItems.length}\n${await page.locator("body").innerText()}`);
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
+  const refresh = await page.evaluate(() => window.__h3RefreshRace.report());
+  assert.ok(refresh.held > 0);
+  assert.equal(refresh.returned, refresh.held);
+  assert.equal(refresh.released, true);
+  assert.equal(refresh.restored, true);
   const snapshot = await call(`/api/creation/projects/${projectId}`);
   assert.equal(snapshot.canvasItems.length, 2);
-  phase = "frame configuration";
   const created = await page.evaluate(
     async ({ projectId, modelId, sources }) => {
       const { creationClient } = await import("/src/backend/creationClient.ts");
@@ -216,48 +206,32 @@ try {
     await page.getByLabel("Choose Last frame", { exact: true }).inputValue(),
     "",
   );
-  phase = "saved content verification";
-  lastSnapshot = await call(`/api/creation/projects/${projectId}`);
+  const final = await call(`/api/creation/projects/${projectId}`);
+  assert.equal(final.generationSpecs.find((spec) => spec.id === created.specId).modelConfigId, model.id);
+  assert.equal(final.references.find((ref) => ref.active && ref.targetSpecId === created.specId && ref.role === "first_frame").source.id, snapshot.canvasItems[0].id);
+  assert.ok(!final.references.some((ref) => ref.active && ref.targetSpecId === created.specId && ref.role === "last_frame"));
   for (const source of snapshot.canvasItems) {
+    assert.ok(final.canvasItems.some((item) => item.id === source.id));
     const assetId = source.binding.objectRef.assetId;
     const response = await fetch(`${api}/api/creation/projects/${projectId}/assets/${assetId}/content`, { headers });
     assert.ok(response.ok);
-    const bytes = Buffer.from(await response.arrayBuffer());
-    assert.deepEqual(bytes, Buffer.from(png, "base64"));
-    record({ savedSource: source.id, assetId, bytes: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") });
+    assert.deepEqual(Buffer.from(await response.arrayBuffer()), Buffer.from(png, "base64"));
   }
-  record({ finalSnapshot: lastSnapshot });
   console.log(
     JSON.stringify({
       passed: true,
       checks: [
+        "pending second import survives background hydration",
         "official provider config",
         "explicit frame roles",
         "frame projection after reload",
         "editable tail slot",
         "tail clearing persists",
+        "saved source bytes and model survive reload",
       ],
     }),
   );
-} catch (error) {
-  record({ error: error.stack, url: page.url() });
-  if (projectId) {
-    try { lastSnapshot = await call(`/api/creation/projects/${projectId}`); }
-    catch (failure) { record({ snapshotError: String(failure) }); }
-  }
-  try {
-    writeFileSync(join(evidenceDir, "page.txt"), await page.locator("body").innerText());
-    await page.screenshot({ path: join(evidenceDir, "failure.png"), fullPage: true });
-  } catch (failure) { record({ pageCaptureError: String(failure) }); }
-  throw error;
 } finally {
-  try {
-    await Promise.all(responses);
-    writeFileSync(join(evidenceDir, "events.json"), JSON.stringify(events, null, 2));
-    if (lastSnapshot) writeFileSync(join(evidenceDir, "project.json"), JSON.stringify(lastSnapshot, null, 2));
-    await page.context().tracing.stop({ path: join(evidenceDir, "trace.zip") });
-    console.log(`H3 diagnostic evidence: ${evidenceDir}`);
-  } finally {
-    await browser.close();
-  }
+  await page.evaluate(() => window.__h3RefreshRace?.restore()).catch(() => {});
+  await browser.close();
 }
