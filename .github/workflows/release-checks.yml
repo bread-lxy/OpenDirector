@@ -283,6 +283,18 @@ jobs:
             if [ -f "$log" ]; then tail -n 150 "$log"; fi
           done
 
+      - name: Upload H3 diagnostic evidence
+        if: always() && matrix.journey == 'isolated'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: h3-diagnostic-evidence-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/opendirector-h3/
+            ${{ runner.temp }}/creation-server.log
+            ${{ runner.temp }}/vite.log
+          retention-days: 3
+          if-no-files-found: warn
+
   # Preserve the existing required-check name and fail closed on failed,
   # cancelled or unexpectedly skipped lanes, including static-gate failures.
   checks:

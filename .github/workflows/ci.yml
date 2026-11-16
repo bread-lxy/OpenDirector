@@ -3,7 +3,7 @@ name: Release checks
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, codex/v2-h3-ci-diagnostics]
   workflow_dispatch:
 
 permissions:
